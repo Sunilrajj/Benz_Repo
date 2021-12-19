@@ -1,0 +1,188 @@
+import groovy.json.JsonSlurper
+
+// Global Variable
+def stageToRun = [:]
+def skipRemainingStages = false
+def date_today = new Date().format("yyyy-MM-dd")
+def this_year =  new Date().format("yyyy")
+def calender_url = "https://calendarific.com/api/v2/holidays?&api_key=90e19de04681bc27e9492b478df436f43aed8c4c&country=IN&year=${this_year}" //Hardcoded the api token since not using credential manager
+
+
+pipeline {
+    agent any
+    stages {
+        stage('Setup parameters') { //Added stage for parameter config as the file is plug and play
+            steps {
+                script { 
+                    properties([
+                        parameters([
+                            booleanParam(
+                                defaultValue: true, 
+                                description: 'This stage will do the check for the code qulaity whether it followed the coding standard or not',
+                                name: 'Static_Check'
+                            ),
+                            booleanParam(
+                                defaultValue: true, 
+                                description: 'This stage will do the Quality analysis for the code',
+                                name: 'QA'
+                            ),
+                            booleanParam(
+                                defaultValue: true, 
+                                description: 'This stage will do the Unit test for the code whter the basic functionality is working or not',
+                                name: 'Unit_Test'
+                            ),                            
+                            string(
+                                defaultValue: '',
+                                name: 'Success_Email',
+                                description: 'Email IDs to send on Successful Build',
+                                trim: true
+                            ),
+                            string(
+                                defaultValue: '', 
+                                name: 'Failure_Email',
+                                description: 'Email IDs to send on Failure Build',
+                                trim: true
+                            )                            
+                        ])
+                    ])
+                }
+            }
+        }
+        stage('Git Pull') {
+            steps { 
+                echo 'cloning git repo'
+                cleanWs()
+                git 'https://github.com/Sunilrajj/Benz_Repo.git'
+            }
+        }
+        stage('Is the run required?') {
+            steps {
+                script {
+                    def response = httpRequest "${calender_url}"
+                    def json = new JsonSlurper().parseText(response.content)
+                    def holiday_list = json['response']['holidays']
+                    for (int i = 0; i < holiday_list.size(); i++) {
+                        if(date_today == holiday_list[i]['date']['iso']){
+                            println('Builds will be skipped today, as its a holiday')
+                            skipRemainingStages = true
+                        }
+                    }
+                }
+            }
+        }
+        stage('Build') {
+            when {  // To skip stage if its holiday
+                expression {
+                    !skipRemainingStages
+                }
+            }
+            steps { 
+                dir("${workspace}"){
+                    sh("mkdir builds")
+                }
+                script {
+                    File file = new File("${workspace}/Build.json")
+                    def build_json = new JsonSlurper().parse(file)
+                    def stages = build_json.keySet()
+                    for (int i = 0; i < stages.size(); i++) {
+                        def yourFile = new File("${workspace}/builds/${build_json[stages[i]]['Name']}")
+                        yourFile.write("${build_json[stages[i]]['Content']}")
+                    }
+                }
+                dir("${workspace}"){
+                    sh("tar -cvzf builds.tar.gz builds") // Instead of zip, used tar packaging since some issues with the zip command https://issues.jenkins.io/browse/JENKINS-46981
+                    sh("rm -rf builds")
+                }
+            }
+        }
+        stage('Integrity Check') {
+            steps {
+                script {
+                    for (int i = 1; i < 3; i++) {
+                        if(i == 1){
+                            stageToRun["Quality"] = prepareSerialStage(skipRemainingStages)
+                        }
+                        else{
+                            stageToRun["Unit_Test"] = prepareParallelStage(skipRemainingStages)
+                        }
+                    } 
+                    parallel stageToRun
+                }
+            }
+
+        }
+        stage('Summary') {
+            steps {
+                script {
+                    if(params.Static_Check == true){
+                        print_summmary('Static_Check', skipRemainingStages)
+                    }
+                    if(params.QA == true){
+                        print_summmary('QA', skipRemainingStages)
+                    }
+                    if(params.Unit_Test == true){
+                        print_summmary('Unit_Test', skipRemainingStages)
+                    }
+                }
+            }
+
+        }
+    } 
+    post { // Email to send to recipients for build results
+    success {
+      mail bcc: '', body: 'Successful Build', cc: '', from: '', replyTo: '', subject: 'Build Successful', to: params.Success_Email
+    }
+    failure {
+      mail bcc: '', body: 'Build Failure', cc: '', from: '', replyTo: '', subject: 'Build Failed', to: params.Failure_Email
+    }
+  }  
+}
+
+// method to serializing QA and Static Check
+def prepareSerialStage(def skipRemainingStages) {
+    return {
+        stage ("Quality") {
+            stage("Static_Check") {
+                    if(!skipRemainingStages && params.Static_Check == true){ //when expression not working since the execution is under steps
+                        create_file() 
+                    }
+            }
+            stage("QA") {
+                    if(!skipRemainingStages && params.QA == true){  //when expression not working since the execution is under steps
+                        create_file()
+                    }
+            }
+        }
+    }
+}
+
+//Method for running parallel stage 
+def prepareParallelStage(def skipRemainingStages) {
+    return {
+            stage("Unit_Test") {
+                    if(!skipRemainingStages && params.Unit_Test == true){
+                        create_file()
+                    }
+            }
+    }
+}
+
+//Method to create stage specific file in stage specific directory
+void create_file() {
+    dir("${workspace}"){
+        sh("mkdir ${STAGE_NAME}")
+        sh("tar -zxvf builds.tar.gz builds/${STAGE_NAME}")
+        sh("mv builds/${STAGE_NAME} ${STAGE_NAME}/")
+    }
+}
+
+//Method to print the summary of the stage
+void print_summmary(def stage_name, def skipRemainingStages) {
+
+    if(skipRemainingStages){
+        println("The stage ${stage_name} has been skipped as its a holiday")
+    }
+    else{
+        println("The stage ${stage_name} has been executed and the file ${stage_name} is copied to the directory ${stage_name}")
+    }
+}
